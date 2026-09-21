@@ -48,6 +48,32 @@ pub const VIRTQ_MSI_NO_VECTOR: u16 = 0xffff;
 /// BAR index we are using for VirtIO configuration
 const VIRTIO_BAR_INDEX: u8 = 0;
 
+/// Validate the guest address at which the capability BAR of a virtio-pci device is mapped.
+///
+/// The BAR is inserted on the MMIO bus at this address and its notification ioeventfds are
+/// registered there, so it must be aligned to the BAR size, must not overflow the guest address
+/// space when its size is added, and must lie inside the 32-bit MMIO window the BAR is
+/// allocated from.
+fn validate_bar_address(address: u64, vm: &Arc<KvmVm>) -> Result<(), PciConfigurationError> {
+    let invalid = || PciConfigurationError::InvalidBarAddress(address);
+
+    // The BAR must fit in the guest address space.
+    let bar_end = address
+        .checked_add(CAPABILITY_BAR_SIZE - 1)
+        .ok_or_else(invalid)?;
+
+    // The BAR must be aligned to its size and lie inside the MMIO window it is allocated from.
+    let allocator = vm.resource_allocator();
+    let window_start = allocator.mmio32_memory.base();
+    let window_end = allocator.mmio32_memory.end();
+
+    if address & (CAPABILITY_BAR_SIZE - 1) != 0 || address < window_start || bar_end > window_end {
+        return Err(invalid());
+    }
+
+    Ok(())
+}
+
 enum PciCapabilityType {
     Common = 1,
     Notify = 2,
@@ -494,11 +520,14 @@ impl VirtioPciDevice {
             vectors,
         ));
 
-        if !state.bars.bar_idx_valid(VIRTIO_BAR_INDEX)
-            || !state.bars.bars[VIRTIO_BAR_INDEX as usize].is_64bit()
-        {
-            return Err(PciConfigurationError::InvalidBarIdx(VIRTIO_BAR_INDEX).into());
-        }
+        // The BAR registers and the address the device is mapped at are both taken from the
+        // state, so validate them before they are used: the BAR address is inserted on the
+        // MMIO bus, where it must not overflow or fall outside the window it was allocated
+        // from, and the BAR registers decide what the guest reads.
+        state
+            .bars
+            .validate_64bit_bar(VIRTIO_BAR_INDEX, CAPABILITY_BAR_SIZE)?;
+        validate_bar_address(state.bar_address, vm)?;
 
         let virtio_pci_device = VirtioPciDevice {
             id,
@@ -1248,8 +1277,9 @@ mod tests {
     use vm_memory::{ByteValued, Le32};
 
     use super::{
-        EventFd, IoEventAddress, KvmVm, NoDatamatch, PciCapabilityType, VIRTQ_MSI_NO_VECTOR,
-        VirtioInterruptMsix, VirtioPciDevice, VirtioPciDeviceError, VirtioPciDeviceState,
+        EventFd, IoEventAddress, KvmVm, NoDatamatch, PciCapabilityType, VIRTIO_BAR_INDEX,
+        VIRTQ_MSI_NO_VECTOR, VirtioInterruptMsix, VirtioPciDevice, VirtioPciDeviceError,
+        VirtioPciDeviceState,
     };
     use crate::Vmm;
     use crate::arch::{MEM_32BIT_DEVICES_SIZE, MEM_32BIT_DEVICES_START};
@@ -1270,7 +1300,7 @@ mod tests {
         ACKNOWLEDGE, DRIVER, DRIVER_OK, FEATURES_OK,
     };
     use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
-    use crate::pci::configuration::BAR0_REG_IDX;
+    use crate::pci::configuration::{BAR0_REG_IDX, PciConfigurationError};
     use crate::pci::msix::{MsixCap, MsixConfig};
     use crate::pci::{PciCapabilityId, PciClassCode, PciDevice, PciSBDF};
     use crate::rate_limiter::RateLimiter;
@@ -2117,9 +2147,7 @@ mod tests {
     }
 
     /// Restore `state` into a new VMM, the way a snapshot restore does.
-    fn restore_state(
-        state: VirtioPciDeviceState,
-    ) -> Result<VirtioPciDevice, VirtioPciDeviceError> {
+    fn restore_state(state: VirtioPciDeviceState) -> Result<VirtioPciDevice, VirtioPciDeviceError> {
         let vmm = default_vmm_with_pci();
         let entropy = Arc::new(Mutex::new(Entropy::new(RateLimiter::default()).unwrap()));
         VirtioPciDevice::new_from_state("rng".to_string(), kvm_vm(&vmm), entropy, state)
@@ -2147,9 +2175,11 @@ mod tests {
         // Vectors are zero-indexed and the device provides one per queue plus one for
         // configuration, so this index does not exist.
         let mut state = save_device_state();
-        let num_vectors =
-            u16::try_from(state.pci_dev_state.msix_queues.len() + 1).unwrap();
-        assert_eq!(msix_vector_count(&create_vmm_with_virtio_pci_device()), num_vectors);
+        let num_vectors = u16::try_from(state.pci_dev_state.msix_queues.len() + 1).unwrap();
+        assert_eq!(
+            msix_vector_count(&create_vmm_with_virtio_pci_device()),
+            num_vectors
+        );
         state.pci_dev_state.msix_config = num_vectors;
         let err = restore_state(state).unwrap_err();
         assert!(
@@ -2203,6 +2233,70 @@ mod tests {
                 VirtioPciDeviceError::CommonConfig(
                     VirtioPciCommonConfigError::InvalidMsixVectorCount(queues, expected)
                 ) if queues == num_queues - 1 && expected == num_queues
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_restore_rejects_invalid_bar_state() {
+        // A BAR that is not a 64bit BAR of the size the device needs.
+        let mut state = save_device_state();
+        state.bars.bars[VIRTIO_BAR_INDEX as usize].encoded_size = 0;
+        let err = restore_state(state).unwrap_err();
+        let expected_decoded_size = 1 << 32;
+        assert!(
+            matches!(
+                err,
+                VirtioPciDeviceError::PciConfiguration(
+                    PciConfigurationError::InvalidBarSize(size)
+                ) if size == expected_decoded_size
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // A BAR address that is not aligned to the BAR size.
+        let mut state = save_device_state();
+        let address = state.bar_address;
+        state.bars.bars[VIRTIO_BAR_INDEX as usize].encoded_addr |= CAPABILITY_BAR_SIZE as u32 / 2;
+        let err = restore_state(state).unwrap_err();
+        let expected_addr = address + CAPABILITY_BAR_SIZE / 2;
+        assert!(
+            matches!(
+                err,
+                VirtioPciDeviceError::PciConfiguration(
+                    PciConfigurationError::InvalidBarAddress(bad)
+                ) if bad == expected_addr
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // An address the device is mapped at that overflows the guest address space.
+        let mut state = save_device_state();
+        let overflow = u64::MAX - CAPABILITY_BAR_SIZE + 2;
+        state.bar_address = overflow;
+        let err = restore_state(state).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VirtioPciDeviceError::PciConfiguration(PciConfigurationError::InvalidBarAddress(
+                    bad
+                )) if bad == overflow
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // An address the device is mapped at that is outside the MMIO window.
+        let mut state = save_device_state();
+        let outside = MEM_32BIT_DEVICES_START + MEM_32BIT_DEVICES_SIZE;
+        state.bar_address = outside;
+        let err = restore_state(state).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VirtioPciDeviceError::PciConfiguration(PciConfigurationError::InvalidBarAddress(
+                    bad
+                )) if bad == outside
             ),
             "unexpected error: {err:?}"
         );

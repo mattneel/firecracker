@@ -25,6 +25,10 @@ pub enum PciConfigurationError {
     InvalidCapPciCfgLength(usize),
     /// Invalid bar_idx: {0}
     InvalidBarIdx(u8),
+    /// Invalid BAR size: {0}
+    InvalidBarSize(u64),
+    /// Invalid BAR address: {0:#x}
+    InvalidBarAddress(u64),
 }
 
 // The number of 32bit registers in the config space, 4096 bytes.
@@ -224,6 +228,36 @@ impl Bars {
         let size_hi = self.bars[(bar_idx + 1) as usize].encoded_size;
         let size_lo = self.bars[bar_idx as usize].encoded_size;
         decode_64_bits_bar_size(size_hi, size_lo)
+    }
+
+    /// Validate that the BAR at `bar_idx` is a usable 64bit memory BAR of `size` bytes.
+    ///
+    /// Unlike [`Bars::set_bar_64`], which encodes a BAR the VMM has chosen itself,
+    /// this works on a BAR that is only presumed to be well-formed, such as one
+    /// coming from a snapshot. It checks that the two registers of the BAR are a
+    /// valid 64bit encoding of `size` and that the address of the BAR is aligned to
+    /// its size.
+    pub fn validate_64bit_bar(&self, bar_idx: u8, size: u64) -> Result<(), PciConfigurationError> {
+        assert!(size.is_power_of_two());
+
+        if !self.bar_idx_valid(bar_idx)
+            || bar_idx >= NUM_BAR_REGS - 1
+            || !self.bars[bar_idx as usize].is_64bit()
+        {
+            return Err(PciConfigurationError::InvalidBarIdx(bar_idx));
+        }
+
+        let encoded_size = self.get_bar_size_64(bar_idx);
+        if encoded_size != size {
+            return Err(PciConfigurationError::InvalidBarSize(encoded_size));
+        }
+
+        let address = self.get_bar_addr_64(bar_idx);
+        if address & (size - 1) != 0 || address.checked_add(size).is_none() {
+            return Err(PciConfigurationError::InvalidBarAddress(address));
+        }
+
+        Ok(())
     }
 
     /// Writes into a given BAR register at the given offset
@@ -1053,6 +1087,49 @@ mod tests {
         assert_eq!(bars.get_bar_addr_64(0), 0x4000_0020_0000);
         // The 64-bit type flag (bit 2) survives the low-register writes.
         assert!(bars.bars[0].is_64bit());
+    }
+
+    #[test]
+    fn test_bars_validate_64bit_bar() {
+        const SIZE: u64 = 0x80000;
+
+        let mut bars = Bars::default();
+        bars.set_bar_64(0, 0x10_0000, SIZE, BarPrefetchable::No);
+        bars.validate_64bit_bar(0, SIZE).unwrap();
+
+        // The size is read from both registers of the BAR.
+        let mut tampered = bars;
+        tampered.bars[0].encoded_size = 0;
+        assert!(matches!(
+            tampered.validate_64bit_bar(0, SIZE),
+            Err(PciConfigurationError::InvalidBarSize(size)) if size == 1 << 32
+        ));
+
+        // A different device asking for a different BAR size.
+        assert!(matches!(
+            bars.validate_64bit_bar(0, SIZE * 2),
+            Err(PciConfigurationError::InvalidBarSize(size)) if size == SIZE
+        ));
+
+        // The address must be aligned to the size of the BAR.
+        let mut tampered = bars;
+        tampered.bars[0].encoded_addr |= SIZE as u32 / 2;
+        assert!(matches!(
+            tampered.validate_64bit_bar(0, SIZE),
+            Err(PciConfigurationError::InvalidBarAddress(addr)) if addr == 0x10_0000 + SIZE / 2
+        ));
+
+        // Only 64bit BARs are accepted, and they need two registers.
+        let mut tampered = bars;
+        tampered.bars[0].encoded_addr &= !0b100;
+        assert!(matches!(
+            tampered.validate_64bit_bar(0, SIZE),
+            Err(PciConfigurationError::InvalidBarIdx(0))
+        ));
+        assert!(matches!(
+            bars.validate_64bit_bar(NUM_BAR_REGS - 1, SIZE),
+            Err(PciConfigurationError::InvalidBarIdx(bar_idx)) if bar_idx == NUM_BAR_REGS - 1
+        ));
     }
 
     #[test]
