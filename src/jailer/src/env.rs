@@ -5,7 +5,7 @@ use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File, OpenOptions, Permissions, canonicalize, read_to_string};
 use std::io;
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -57,12 +57,44 @@ const DEV_URANDOM_MINOR: u32 = 9;
 const DEV_UFFD_PATH: &CStr = c"/dev/userfaultfd";
 const DEV_UFFD_MAJOR: u32 = 10;
 
+// Folder containing the VFIO character devices: the container node and one node
+// per IOMMU group. Firecracker opens them when it attaches a passthrough
+// device. Their minor numbers are allocated dynamically by the kernel, so the
+// nodes are copied from the host instead of being created with fixed numbers.
+const DEV_VFIO_DIR: &str = "/dev/vfio";
+
+// Sysfs entries Firecracker reads for a passthrough device: the device's folder,
+// which holds the link to its IOMMU group, and the folder the kernel groups the
+// IOMMUs of the host by. The driver name marks a device as available for
+// passthrough.
+const SYSFS_PCI_DEVICES_DIR: &str = "/sys/bus/pci/devices";
+const SYSFS_IOMMU_GROUPS_DIR: &str = "/sys/kernel/iommu_groups";
+const VFIO_PCI_DRIVER: &str = "vfio-pci";
+
+/// A character device of the host's VFIO folder, to be created inside the jail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VfioCharDevice {
+    /// Name of the device inside the folder, e.g. `vfio` or an IOMMU group number.
+    name: String,
+    major: u32,
+    minor: u32,
+}
+
+/// A PCI device of the host that is bound to the VFIO driver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VfioPciDevice {
+    /// Name of the device under `/sys/bus/pci/devices`, e.g. `0000:00:02.0`.
+    name: String,
+    /// Name of its IOMMU group under `/sys/kernel/iommu_groups`.
+    iommu_group: String,
+}
+
 // Relevant folders inside the jail that we create or/and for which we change ownership.
 // We need /dev in order to be able to create /dev/kvm and /dev/net/tun device.
 // We need /run for the default location of the api socket.
 // Since libc::chown is not recursive, we cannot specify only /dev/net as we want
 // to walk through the entire folder hierarchy.
-const FOLDER_HIERARCHY: [&str; 4] = ["/", "/dev", "/dev/net", "/run"];
+const FOLDER_HIERARCHY: [&str; 6] = ["/", "/dev", "/dev/net", "/dev/vfio", "/run", "/sys"];
 const FOLDER_PERMISSIONS: u32 = 0o700;
 
 // When running with `--new-pid-ns` flag, the PID of the process running the exec_file differs
@@ -131,6 +163,8 @@ pub struct Env {
     cgroup_conf: Option<CgroupConfiguration>,
     resource_limits: ResourceLimits,
     uffd_dev_minor: Option<u32>,
+    vfio_devices: Vec<VfioCharDevice>,
+    vfio_pci_devices: Vec<VfioPciDevice>,
 }
 
 /// Creates a new file owned by the given uid/gid at `dst` and writes `line`
@@ -275,6 +309,10 @@ impl Env {
         }
 
         let uffd_dev_minor = Self::get_userfaultfd_minor_dev_number().ok();
+        // Read the VFIO devices before chrooting: their paths are only valid in
+        // the host's filesystem.
+        let vfio_devices = Self::host_vfio_devices();
+        let vfio_pci_devices = Self::host_vfio_pci_devices();
 
         Ok(Env {
             id: id.to_owned(),
@@ -292,6 +330,8 @@ impl Env {
             cgroup_conf,
             resource_limits,
             uffd_dev_minor,
+            vfio_devices,
+            vfio_pci_devices,
         })
     }
 
@@ -471,6 +511,102 @@ impl Env {
             .map_err(|err| {
                 JailerError::ChangeFileOwner(PathBuf::from(dev_path.to_str().unwrap()), err)
             })
+    }
+
+    /// The character devices of the host's VFIO folder, read before the jailer
+    /// chroots into the jail.
+    fn host_vfio_devices() -> Vec<VfioCharDevice> {
+        Self::vfio_char_devices(Path::new(DEV_VFIO_DIR))
+    }
+
+    /// Character devices in `dir`, with the device numbers assigned by the
+    /// kernel. A host without VFIO has no such folder and yields an empty list.
+    fn vfio_char_devices(dir: &Path) -> Vec<VfioCharDevice> {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                Self::vfio_char_device(name, &entry.metadata().ok()?)
+            })
+            .collect()
+    }
+
+    /// The VFIO character device of an entry, or `None` if it is not one.
+    fn vfio_char_device(name: String, metadata: &fs::Metadata) -> Option<VfioCharDevice> {
+        if !metadata.file_type().is_char_device() {
+            return None;
+        }
+
+        Some(VfioCharDevice {
+            name,
+            major: libc::major(metadata.rdev()),
+            minor: libc::minor(metadata.rdev()),
+        })
+    }
+
+    /// Create the VFIO character devices inside the jail, owned by the jail's
+    /// user. Called after chrooting, so the paths are relative to the jail.
+    fn create_vfio_devices(&self) -> Result<(), JailerError> {
+        for device in &self.vfio_devices {
+            let dev_path = CString::new(format!("{DEV_VFIO_DIR}/{}", device.name))
+                .map_err(JailerError::CStringParsing)?;
+            self.mknod_and_own_dev(&dev_path, device.major, device.minor)?;
+        }
+
+        Ok(())
+    }
+
+    /// The PCI devices of the host that are bound to the VFIO driver, read before
+    /// the jailer chroots into the jail.
+    fn host_vfio_pci_devices() -> Vec<VfioPciDevice> {
+        let Ok(entries) = fs::read_dir(SYSFS_PCI_DEVICES_DIR) else {
+            return Vec::new();
+        };
+
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let device = entry.path();
+                if Self::symlink_name(&device.join("driver"))? != VFIO_PCI_DRIVER {
+                    return None;
+                }
+
+                Some(VfioPciDevice {
+                    name: entry.file_name().to_string_lossy().into_owned(),
+                    iommu_group: Self::symlink_name(&device.join("iommu_group"))?,
+                })
+            })
+            .collect()
+    }
+
+    /// Name of the target of the symlink at `path`, e.g. the driver a device is
+    /// bound to or the name of the IOMMU group it belongs to.
+    fn symlink_name(path: &Path) -> Option<String> {
+        Some(path.read_link().ok()?.file_name()?.to_str()?.to_owned())
+    }
+
+    /// Mirror the sysfs entries Firecracker reads for a passthrough device: the
+    /// device's folder and the link to its IOMMU group. The link points at the
+    /// host path, which does not resolve inside the jail, but only the name of
+    /// the group matters. Called after chrooting.
+    fn create_vfio_pci_devices(&self) -> Result<(), JailerError> {
+        for device in &self.vfio_pci_devices {
+            let device_dir = Path::new(SYSFS_PCI_DEVICES_DIR).join(&device.name);
+            self.setup_jailed_folder(&device_dir)?;
+
+            let link_path = device_dir.join("iommu_group");
+            let target = Path::new(SYSFS_IOMMU_GROUPS_DIR).join(&device.iommu_group);
+            // The link is not owned by the jail's user: symlink permissions are
+            // not enforced on Linux, and the folder holding it is.
+            std::os::unix::fs::symlink(&target, &link_path)
+                .map_err(|err| JailerError::CreateSymlink(link_path, err))?;
+        }
+
+        Ok(())
     }
 
     fn setup_jailed_folder(&self, folder: impl AsRef<Path>) -> Result<(), JailerError> {
@@ -710,6 +846,18 @@ impl Env {
         // Expose the device in the jailed environment.
         if let Some(minor) = self.uffd_dev_minor {
             self.mknod_and_own_dev(DEV_UFFD_PATH, DEV_UFFD_MAJOR, minor)?;
+        }
+
+        // Expose the VFIO device nodes and the sysfs entries of the devices
+        // bound to the VFIO driver, if this host has any, so that passthrough
+        // devices can be attached. They were read before chrooting. This is not
+        // fatal: microVMs without passthrough devices do not need them.
+        if let Err(err) = self
+            .create_vfio_devices()
+            .and_then(|()| self.create_vfio_pci_devices())
+        {
+            println!("Warning! Could not expose the VFIO devices inside jailer: {err}.");
+            println!("Device passthrough will not be available to use.");
         }
 
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
@@ -1190,6 +1338,34 @@ mod tests {
             let dev_path = dev.to_str().map(CString::new).unwrap().unwrap();
             ensure_mknod_and_own_dev(&env, &dev_path, major, minor);
         }
+    }
+
+    #[test]
+    fn test_vfio_char_device() {
+        // The device numbers are the ones the kernel assigned to the device.
+        assert_eq!(
+            Env::vfio_char_device("vfio".to_owned(), &fs::metadata("/dev/null").unwrap()),
+            Some(VfioCharDevice {
+                name: "vfio".to_owned(),
+                major: 1,
+                minor: 3,
+            })
+        );
+
+        // Anything that is not a character device is left alone.
+        assert_eq!(
+            Env::vfio_char_device("dev".to_owned(), &fs::metadata("/dev").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_vfio_char_devices_without_host_devices() {
+        // A host without VFIO has nothing to expose, and that must not fail the
+        // jailer. Other hosts are covered by `test_vfio_char_device` plus the
+        // integration test that attaches a device under the jailer.
+        let dir = TempDir::new().unwrap();
+        assert!(Env::vfio_char_devices(&dir.as_path().join("missing")).is_empty());
     }
 
     #[test]
