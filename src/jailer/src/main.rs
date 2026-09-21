@@ -66,6 +66,8 @@ pub enum JailerError {
     Copy(PathBuf, PathBuf, io::Error),
     #[error("{}", format!("Failed to create directory {:?}: {}", .0, .1).replace('\"', ""))]
     CreateDir(PathBuf, io::Error),
+    #[error("{}", format!("Failed to create symlink {:?}: {}", .0, .1).replace('\"', ""))]
+    CreateSymlink(PathBuf, io::Error),
     #[error("Encountered interior \\0 while parsing a string")]
     CStringParsing(NulError),
     #[error("Failed to daemonize: {0}")]

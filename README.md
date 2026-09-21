@@ -118,6 +118,8 @@ The **API endpoint** can be used to:
 - Configure and manage [memory hotplugging](docs/memory-hotplug.md).
 - `[Developer Preview]` [Hot-plug and hot-unplug](docs/device-hotplug.md) virtio
   PCI devices while the VM is running.
+- `[Developer Preview]` [Attach](docs/device-passthrough.md) host PCIe devices,
+  such as GPUs, to the microVM through VFIO.
 - Start the microVM using a given kernel image, root file system, and boot
   arguments.
 - [x86_64 only] Stop the microVM.

@@ -449,6 +449,7 @@ pub fn build_microvm_from_snapshot(
     // Build Vmm.
     debug!("event_start: build microvm from snapshot");
     vm_resources.validate()?;
+    vm_resources.compatible_with_snapshot_restore()?;
 
     let kvm = Kvm::new(microvm_state.kvm_state.kvm_cap_modifiers.clone())
         .map_err(StartMicrovmError::Kvm)?;
