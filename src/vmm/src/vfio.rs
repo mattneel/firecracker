@@ -94,14 +94,18 @@ pub struct VfioBarEmulatedArea {
     pub size: u64,
 }
 
-// TODO with addition of BAR relocation to `Bars` type, guest now can change the gpa addresses of
-// BARs, which will cause the `vfio_deallocate_memory_ranges_for_bars` to panic when it will try to
-// give the ranges back to the memory allocator. This will be addressed when BAR relocation will be
-// implemented for VFIO devices.
 /// Wrapper around `Bars` type to automate dropping
 #[derive(Debug)]
 struct VfioBars {
     bars: Bars,
+    /// The BARs as they were assigned by the VMM, which is what the allocated
+    /// ranges are derived from.
+    ///
+    /// The driver can rewrite the BAR registers (`Bars::write` implements the PCI
+    /// size probing and accepts new addresses), and writes to memory BARs are
+    /// passed through to the device, so `bars` cannot be used to find the ranges
+    /// to return to the allocator on teardown.
+    assigned: Bars,
     vm: Arc<KvmVm>,
 }
 
@@ -116,7 +120,17 @@ impl VfioBars {
             let resource_allocator = resource_allocator_lock.deref_mut();
             vfio_allocate_memory_ranges_for_bars(resource_allocator, &bar_infos)?
         };
-        Ok(Self { bars, vm })
+        Ok(Self::from_assigned_bars(bars, vm))
+    }
+
+    /// Create the wrapper around BARs that have already been assigned from the
+    /// resource allocator.
+    fn from_assigned_bars(bars: Bars, vm: Arc<KvmVm>) -> Self {
+        Self {
+            bars,
+            assigned: bars,
+            vm,
+        }
     }
 }
 
@@ -124,7 +138,7 @@ impl Drop for VfioBars {
     fn drop(&mut self) {
         let mut resource_allocator_lock = self.vm.resource_allocator();
         let resource_allocator = resource_allocator_lock.deref_mut();
-        vfio_deallocate_memory_ranges_for_bars(resource_allocator, &self.bars);
+        vfio_deallocate_memory_ranges_for_bars(resource_allocator, &self.assigned);
     }
 }
 
@@ -739,24 +753,45 @@ fn vfio_allocate_memory_ranges_for_bars(
 }
 
 /// Give memory ranges allocated for BARs back to the resource allocator
+///
+/// `bars` must hold the BARs as they were assigned by the allocator: the driver
+/// can change the registers, so values that come from a running VM are not
+/// necessarily backed by an allocation. This runs on teardown, so it must not
+/// panic on unexpected input.
 fn vfio_deallocate_memory_ranges_for_bars(resource_allocator: &mut ResourceAllocator, bars: &Bars) {
     let mut bar_idx = 0;
     while bar_idx < NUM_BAR_REGS {
-        if bars.bars[bar_idx as usize].used() {
-            let start = bars.get_bar_addr(bar_idx);
-            let size = bars.get_bar_size(bar_idx);
-            // SAFETY: these values were provided by the allocator in the first place
-            let range = RangeInclusive::new(start, start + size - 1).unwrap();
-            if bars.bars[bar_idx as usize].is_64bit() {
-                resource_allocator.mmio64_memory.free(&range).unwrap();
-                bar_idx += 2;
-            } else {
-                resource_allocator.mmio32_memory.free(&range).unwrap();
-                bar_idx += 1;
-            }
-        } else {
-            bar_idx += 1;
+        let bar = bars.bars[bar_idx as usize];
+        let is_64bit = bar.is_64bit();
+        let next_bar_idx = bar_idx + if is_64bit { 2 } else { 1 };
+
+        if !bar.used() {
+            bar_idx = next_bar_idx;
+            continue;
         }
+
+        let start = bars.get_bar_addr(bar_idx);
+        let size = bars.get_bar_size(bar_idx);
+        let range = size
+            .checked_sub(1)
+            .and_then(|last_byte_offset| start.checked_add(last_byte_offset))
+            .and_then(|end| RangeInclusive::new(start, end).ok());
+
+        match range {
+            Some(range) => {
+                let allocator = if is_64bit {
+                    &mut resource_allocator.mmio64_memory
+                } else {
+                    &mut resource_allocator.mmio32_memory
+                };
+                if let Err(err) = allocator.free(&range) {
+                    error!("Cannot free BAR{bar_idx} range {range:?}: {err:?}");
+                }
+            }
+            None => error!("Cannot free BAR{bar_idx} range: start {start:#x} size {size:#x}"),
+        }
+
+        bar_idx = next_bar_idx;
     }
 }
 
@@ -1319,6 +1354,71 @@ mod tests {
         let header = ((next_offset as u32) << 20) | (1 << 16) | (cap_id as u32);
         config_space[(offset / 4) as usize] = header;
         offset / 4
+    }
+
+    /// Allocate a range from the mmio64 allocator the way `VfioBars::new` does.
+    fn allocate_bar_range(vm: &Arc<KvmVm>, size: u64) -> u64 {
+        vm.resource_allocator()
+            .mmio64_memory
+            .allocate(size, size, AllocPolicy::FirstMatch)
+            .unwrap()
+            .start()
+    }
+
+    /// Check that a range is free again by allocating it back.
+    fn assert_range_free(vm: &Arc<KvmVm>, start: u64, size: u64) {
+        vm.resource_allocator()
+            .mmio64_memory
+            .allocate(size, size, AllocPolicy::ExactMatch(start))
+            .expect("BAR range was not returned to the allocator");
+    }
+
+    #[test]
+    fn test_vfio_bars_drop_frees_assigned_ranges() {
+        let vmm = crate::builder::tests::default_vmm_with_pci();
+        let vm = vmm.vm.as_kvm().unwrap().clone();
+
+        const SIZE: u64 = 0x1000_0000;
+        let base = allocate_bar_range(&vm, SIZE);
+
+        let mut bars = Bars::default();
+        bars.set_bar_64(0, base, SIZE, BarPrefetchable::No);
+        let vfio_bars = VfioBars::from_assigned_bars(bars, vm.clone());
+
+        drop(vfio_bars);
+        assert_range_free(&vm, base, SIZE);
+    }
+
+    #[test]
+    fn test_vfio_bars_drop_after_driver_writes() {
+        let vmm = crate::builder::tests::default_vmm_with_pci();
+        let vm = vmm.vm.as_kvm().unwrap().clone();
+
+        const SIZE: u64 = 0x1000_0000;
+        let base = allocate_bar_range(&vm, SIZE);
+
+        let mut bars = Bars::default();
+        bars.set_bar_64(0, base, SIZE, BarPrefetchable::No);
+        let mut vfio_bars = VfioBars::from_assigned_bars(bars, vm.clone());
+
+        // Probing the BAR size and programming a new address, both of which the
+        // driver is allowed to do through the config space registers. A 64bit BAR
+        // is written through the two registers that hold its halves.
+        for write in [u64::MAX, base + SIZE, 0] {
+            let (low, high) = (write & u64::from(u32::MAX), write >> 32);
+            vfio_bars
+                .bars
+                .write(0, 0, &u32::try_from(low).unwrap().to_le_bytes());
+            vfio_bars
+                .bars
+                .write(1, 0, &u32::try_from(high).unwrap().to_le_bytes());
+            assert_eq!(vfio_bars.bars.get_bar_addr_64(0), write & !(SIZE - 1));
+        }
+
+        // The ranges to free are the ones the VMM assigned, not the driver's.
+        vfio_bars.bars.write(0, 0, &u32::MAX.to_le_bytes());
+        drop(vfio_bars);
+        assert_range_free(&vm, base, SIZE);
     }
 
     #[test]
