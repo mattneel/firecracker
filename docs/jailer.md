@@ -139,9 +139,14 @@ After starting, the Jailer goes through the following operations:
   and call `chroot` into the current directory.
 - Use `mknod` to create a `/dev/net/tun` equivalent inside the jail.
 - Use `mknod` to create a `/dev/kvm` equivalent inside the jail.
+- Use `mknod` to create a `/dev/vfio` equivalent inside the jail, unless the
+  host has no VFIO support. The VFIO container node and the IOMMU group nodes
+  have dynamically allocated minor numbers, so they are created with the same
+  device numbers as the ones of the host. They are needed by Firecracker in
+  order to attach PCI devices with the `device-passthrough` API.
 - Use `chown` to change ownership of the `<chroot_dir>` (root path `/` as seen
-  by the jailed firecracker), `/dev/net/tun`, `/dev/kvm`. The ownership is
-  changed to the provided `<uid>:<gid>`.
+  by the jailed firecracker), `/dev/net/tun`, `/dev/kvm`, `/dev/vfio`. The
+  ownership is changed to the provided `<uid>:<gid>`.
 - If `--netns <netns>` is present, attempt to join the specified network
   namespace.
 - If `--daemonize` is specified, call `setsid()` and redirect `STDIN`, `STDOUT`,

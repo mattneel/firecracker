@@ -10,6 +10,14 @@ and this project adheres to
 
 ### Added
 
+- Added support for attaching host PCIe devices to a microVM through VFIO,
+  configured with the `PUT /device-passthrough/{id}` API or the
+  `device-passthrough` configuration field. Requires the PCI transport
+  (`--enable-pci`) and a device bound to `vfio-pci`; see the
+  [device passthrough documentation](docs/device-passthrough.md). Tracking
+  issue:
+  [#5679](https://github.com/firecracker-microvm/firecracker/issues/5679).
+
 ### Changed
 
 ### Deprecated
