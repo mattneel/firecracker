@@ -24,7 +24,7 @@ use zerocopy::IntoBytes;
 use crate::devices::virtio::ActivateError;
 use crate::devices::virtio::device::{VirtioDevice, VirtioDeviceType};
 use crate::devices::virtio::transport::pci::common_config::{
-    VirtioPciCommonConfig, VirtioPciCommonConfigState,
+    VirtioPciCommonConfig, VirtioPciCommonConfigError, VirtioPciCommonConfigState,
 };
 use crate::devices::virtio::transport::pci::device_status::*;
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
@@ -256,6 +256,8 @@ pub enum VirtioPciDeviceError {
     PciConfiguration(#[from] PciConfigurationError),
     /// Invalid restore state: driver_status {0:#x} is inconsistent with device_activated (expected {1:#x})
     InvalidRestoreState(u8, u8),
+    /// Invalid virtio PCI common configuration state: {0}
+    CommonConfig(#[from] VirtioPciCommonConfigError),
     /// Restored MSI-X vector count ({0}) does not match the expected count ({1}) for this device
     UnexpectedMsixVectorCount(usize, usize),
     /// Could not activate restored device: {0}
@@ -444,13 +446,20 @@ impl VirtioPciDevice {
         let vectors = msix_config.vectors.clone();
 
         // Expecting one vector per queue, plus one for the configuration
-        let expected_num_vectors = device.lock().expect("Poisoned lock").queues().len() + 1;
+        let num_queues = device.lock().expect("Poisoned lock").queues().len();
+        let expected_num_vectors = num_queues + 1;
         if vectors.vectors.len() != expected_num_vectors {
             return Err(VirtioPciDeviceError::UnexpectedMsixVectorCount(
                 vectors.vectors.len(),
                 expected_num_vectors,
             ));
         }
+
+        // The selected vectors are used as indices into the MSI-X table, so a state that refers
+        // to vectors the device does not provide must be rejected before it is used.
+        state
+            .pci_dev_state
+            .validate_msix_vectors(vectors.vectors.len(), num_queues)?;
 
         let msix_config = Arc::new(Mutex::new(msix_config));
 
@@ -921,13 +930,20 @@ impl VirtioInterrupt for VirtioInterruptMsix {
         }
 
         let config = &mut self.msix_config.lock().unwrap();
-        let entry = &config.table_entries[vector as usize];
+        // Both the driver writes and the restore path only accept vectors that the device
+        // provides, but never index the table without checking: an out-of-bounds access here
+        // would abort the VMM.
+        let masked = config
+            .table_entries
+            .get(vector as usize)
+            .ok_or(InterruptError::InvalidVectorIndex(vector as usize))?
+            .masked();
         // In case the vector control register associated with the entry
         // has its first bit set, this means the vector is masked and the
         // device should not inject the interrupt.
         // Instead, the Pending Bit Array table is updated to reflect there
         // is a pending interrupt for this specific vector.
-        if config.masked || entry.masked() {
+        if config.masked || masked {
             config.set_pba_bit(vector, false);
             return Ok(());
         }
@@ -1224,14 +1240,17 @@ impl BusDevice for VirtioPciDevice {
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::{Arc, Mutex};
 
     use linux_loader::loader::Cmdline;
     use vm_allocator::{AllocPolicy, RangeInclusive};
     use vm_memory::{ByteValued, Le32};
 
-    use super::{EventFd, IoEventAddress, KvmVm, NoDatamatch, PciCapabilityType, VirtioPciDevice};
+    use super::{
+        EventFd, IoEventAddress, KvmVm, NoDatamatch, PciCapabilityType, VIRTQ_MSI_NO_VECTOR,
+        VirtioInterruptMsix, VirtioPciDevice, VirtioPciDeviceError, VirtioPciDeviceState,
+    };
     use crate::Vmm;
     use crate::arch::{MEM_32BIT_DEVICES_SIZE, MEM_32BIT_DEVICES_START};
     use crate::builder::tests::default_vmm_with_pci;
@@ -1239,6 +1258,7 @@ mod tests {
     use crate::devices::virtio::device::VirtioDeviceType;
     use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
     use crate::devices::virtio::rng::Entropy;
+    use crate::devices::virtio::transport::pci::common_config::VirtioPciCommonConfigError;
     use crate::devices::virtio::transport::pci::common_config_offset::*;
     use crate::devices::virtio::transport::pci::device::{
         CAPABILITY_BAR_SIZE, COMMAND_MEMORY_SPACE_ENABLE, COMMAND_REG, COMMON_CONFIG_BAR_OFFSET,
@@ -1249,10 +1269,12 @@ mod tests {
     use crate::devices::virtio::transport::pci::device_status::{
         ACKNOWLEDGE, DRIVER, DRIVER_OK, FEATURES_OK,
     };
+    use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
     use crate::pci::configuration::BAR0_REG_IDX;
-    use crate::pci::msix::MsixCap;
-    use crate::pci::{PciCapabilityId, PciClassCode, PciDevice};
+    use crate::pci::msix::{MsixCap, MsixConfig};
+    use crate::pci::{PciCapabilityId, PciClassCode, PciDevice, PciSBDF};
     use crate::rate_limiter::RateLimiter;
+    use crate::vstate::interrupts::InterruptError;
 
     /// The address the single virtio-pci BAR of a freshly booted VM ends up
     /// at: the first CAPABILITY_BAR_SIZE-aligned address of the 32-bit MMIO
@@ -2071,5 +2093,139 @@ mod tests {
         setup_queues(&mut locked);
         write_driver_status(&mut locked, ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK);
         assert!(locked.device_activated.load(Ordering::SeqCst));
+    }
+
+    /// Number of MSI-X vectors the device attached to `vmm` provides.
+    fn msix_vector_count(vmm: &Vmm) -> u16 {
+        let device = get_virtio_device(vmm);
+        device
+            .lock()
+            .unwrap()
+            .msix_config
+            .lock()
+            .unwrap()
+            .table_entries
+            .len()
+            .try_into()
+            .unwrap()
+    }
+
+    /// Save the state of the PCI device of a new VMM, the way snapshot creation does.
+    fn save_device_state() -> VirtioPciDeviceState {
+        let vmm = create_vmm_with_virtio_pci_device();
+        get_virtio_device(&vmm).lock().unwrap().state()
+    }
+
+    /// Restore `state` into a new VMM, the way a snapshot restore does.
+    fn restore_state(
+        state: VirtioPciDeviceState,
+    ) -> Result<VirtioPciDevice, VirtioPciDeviceError> {
+        let vmm = default_vmm_with_pci();
+        let entropy = Arc::new(Mutex::new(Entropy::new(RateLimiter::default()).unwrap()));
+        VirtioPciDevice::new_from_state("rng".to_string(), kvm_vm(&vmm), entropy, state)
+    }
+
+    #[test]
+    fn test_restore_state() {
+        let state = save_device_state();
+        assert_eq!(state.bar_address, FIRST_BAR_BASE);
+
+        // The state of a device that was never started must be restorable.
+        let restored = restore_state(state).unwrap();
+        assert!(!restored.device_activated.load(Ordering::SeqCst));
+        assert_eq!(restored.bar_address(), FIRST_BAR_BASE);
+
+        // Vectors that the device provides, including the unmapped one, are accepted.
+        let mut state = save_device_state();
+        state.pci_dev_state.msix_config = VIRTQ_MSI_NO_VECTOR;
+        state.pci_dev_state.msix_queues = vec![0];
+        restore_state(state).unwrap();
+    }
+
+    #[test]
+    fn test_restore_rejects_unknown_msix_vector() {
+        // Vectors are zero-indexed and the device provides one per queue plus one for
+        // configuration, so this index does not exist.
+        let mut state = save_device_state();
+        let num_vectors =
+            u16::try_from(state.pci_dev_state.msix_queues.len() + 1).unwrap();
+        assert_eq!(msix_vector_count(&create_vmm_with_virtio_pci_device()), num_vectors);
+        state.pci_dev_state.msix_config = num_vectors;
+        let err = restore_state(state).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VirtioPciDeviceError::CommonConfig(
+                    VirtioPciCommonConfigError::InvalidMsixVector(vector, count)
+                ) if vector == num_vectors && count == usize::from(num_vectors)
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // The vector of the first queue.
+        let mut state = save_device_state();
+        state.pci_dev_state.msix_queues[0] = num_vectors;
+        let err = restore_state(state).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VirtioPciDeviceError::CommonConfig(
+                    VirtioPciCommonConfigError::InvalidMsixVector(vector, count)
+                ) if vector == num_vectors && count == usize::from(num_vectors)
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_restore_rejects_wrong_number_of_queue_vectors() {
+        let mut state = save_device_state();
+        let num_queues = state.pci_dev_state.msix_queues.len();
+
+        state.pci_dev_state.msix_queues.push(VIRTQ_MSI_NO_VECTOR);
+        let err = restore_state(state).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VirtioPciDeviceError::CommonConfig(
+                    VirtioPciCommonConfigError::InvalidMsixVectorCount(queues, expected)
+                ) if queues == num_queues + 1 && expected == num_queues
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        let mut state = save_device_state();
+        state.pci_dev_state.msix_queues.pop();
+        let err = restore_state(state).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                VirtioPciDeviceError::CommonConfig(
+                    VirtioPciCommonConfigError::InvalidMsixVectorCount(queues, expected)
+                ) if queues == num_queues - 1 && expected == num_queues
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_trigger_unknown_vector_is_an_error() {
+        let vmm = default_vmm_with_pci();
+        let vectors = Arc::new(KvmVm::create_msix_group(kvm_vm(&vmm).clone(), 1).unwrap());
+        let msix_config = Arc::new(Mutex::new(MsixConfig::new(
+            vectors.clone(),
+            PciSBDF::default(),
+        )));
+        // The device provides a single vector, with index 0.
+        let config_vector = Arc::new(AtomicU16::new(1));
+        let interrupt = VirtioInterruptMsix::new(
+            msix_config,
+            config_vector,
+            Arc::new(Mutex::new(vec![VIRTQ_MSI_NO_VECTOR])),
+            vectors,
+        );
+
+        let err = VirtioInterrupt::trigger(&interrupt, VirtioInterruptType::Config).unwrap_err();
+        assert!(matches!(err, InterruptError::InvalidVectorIndex(1)));
     }
 }

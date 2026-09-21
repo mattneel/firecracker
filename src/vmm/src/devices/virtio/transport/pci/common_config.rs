@@ -34,6 +34,50 @@ pub struct VirtioPciCommonConfigState {
     pub msix_queues: Vec<u16>,
 }
 
+/// Errors for the virtio PCI common configuration state.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum VirtioPciCommonConfigError {
+    /// MSI-X vector {0} selected in the restored state is out of range (device provides {1} vectors)
+    InvalidMsixVector(u16, usize),
+    /// Restored state has {0} queue MSI-X vectors, but the device has {1} queues
+    InvalidMsixVectorCount(usize, usize),
+}
+
+impl VirtioPciCommonConfigState {
+    /// Validate the MSI-X vectors selected by the driver in a restored state.
+    ///
+    /// The driver selects one vector for configuration notifications and one per
+    /// queue, and the device offers exactly one vector per queue plus one for
+    /// configuration. Selections that do not refer to an existing vector are not
+    /// preserved by the live paths, which store `VIRTQ_MSI_NO_VECTOR` instead
+    /// (see [`VirtioPciCommonConfig::write_common_config_word`]), and the vector
+    /// is later used as an index into the MSI-X table, so a state file that holds
+    /// any other value must not be accepted.
+    pub fn validate_msix_vectors(
+        &self,
+        num_vectors: usize,
+        num_queues: usize,
+    ) -> Result<(), VirtioPciCommonConfigError> {
+        if self.msix_queues.len() != num_queues {
+            return Err(VirtioPciCommonConfigError::InvalidMsixVectorCount(
+                self.msix_queues.len(),
+                num_queues,
+            ));
+        }
+
+        for vector in std::iter::once(self.msix_config).chain(self.msix_queues.iter().copied()) {
+            if vector != VIRTQ_MSI_NO_VECTOR && usize::from(vector) >= num_vectors {
+                return Err(VirtioPciCommonConfigError::InvalidMsixVector(
+                    vector,
+                    num_vectors,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Contains the data for reading and writing the common configuration structure of a virtio PCI
 /// device.
 #[derive(Debug)]
