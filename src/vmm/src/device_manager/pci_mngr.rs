@@ -83,6 +83,10 @@ pub enum PciManagerError {
     Kvm(#[from] vmm_sys_util::errno::Error),
     /// VFIO error: {0}
     Vfio(#[from] VfioError),
+    /// VFIO container is not initialized
+    MissingVfioContainer,
+    /// Passthrough device {0} is already configured
+    DuplicatePassthroughDevice(String),
 }
 
 impl PciDevices {
@@ -248,10 +252,12 @@ impl PciDevices {
         config: DevicePassthroughConfig,
     ) -> Result<(), PciManagerError> {
         for device in self.vfio_devices.iter() {
-            let device = device.lock().unwrap();
-            // SAFETY: We must never add 2 devices with same id or same SBDF
-            assert_ne!(device.config.id, config.id);
-            assert_ne!(device.config.sbdf, config.sbdf);
+            let device = device.lock().expect("Poisoned lock");
+            // The config layer rejects duplicates, this is a safety net for the
+            // restore path, where the device list comes from a snapshot.
+            if device.config.id == config.id || device.config.sbdf == config.sbdf {
+                return Err(PciManagerError::DuplicatePassthroughDevice(config.id));
+            }
         }
 
         let pci_device_bdf = self.pci_segment.next_device_sbdf()?;
@@ -261,43 +267,49 @@ impl PciDevices {
             let container = vfio_create_kvm_vfio_device_and_vfio_container(vm.as_ref())?;
             self.vfio_container = Some(container);
         }
-        let container = self.vfio_container.as_ref().unwrap();
+        let container = self
+            .vfio_container
+            .clone()
+            .ok_or(PciManagerError::MissingVfioContainer)?;
         let is_first_device = self.vfio_devices.is_empty();
 
-        let device = match VfioDevice::new(container, vm, config, pci_device_bdf) {
-            Ok(d) => d,
-            Err(e) => {
-                if is_first_device {
-                    self.vfio_container = None;
-                }
-                return Err(e.into());
+        let device = VfioDevice::new(&container, vm, config, pci_device_bdf).inspect_err(|_| {
+            if is_first_device {
+                self.vfio_container = None;
             }
-        };
+        })?;
 
-        if is_first_device && let Err(e) = vfio_dma_map_guest_memory(container, vm.guest_memory()) {
+        if is_first_device && let Err(e) = vfio_dma_map_guest_memory(&container, vm.guest_memory())
+        {
             self.vfio_container = None;
             return Err(e.into());
         }
 
         // Copy this to avoid needing to lock device mutex below
         let emulated_area = device.msix_state.emulated_area;
-
         let device = Arc::new(Mutex::new(device));
 
-        // This is for config space
+        // The device is visible to the driver through its config space and the
+        // emulated part of its BARs from here on, so register it on both buses and
+        // undo the first registration if the second one fails.
         self.pci_segment
             .pci_bus
             .lock()
-            .unwrap()
-            // SAFETY: we should never add 2 devices with same device id
-            .add_device(pci_device_bdf.device(), device.clone())
-            .unwrap();
+            .expect("Poisoned lock")
+            .add_device(pci_device_bdf.device(), device.clone())?;
 
-        vm.common
-            .mmio_bus
-            // SAFETY: area must be valid
-            .insert(device.clone(), emulated_area.gpa, emulated_area.size)
-            .unwrap();
+        if let Err(err) =
+            vm.common
+                .mmio_bus
+                .insert(device.clone(), emulated_area.gpa, emulated_area.size)
+        {
+            self.pci_segment
+                .pci_bus
+                .lock()
+                .expect("Poisoned lock")
+                .remove_device(pci_device_bdf.device());
+            return Err(err.into());
+        }
 
         self.vfio_devices.push(device);
 
