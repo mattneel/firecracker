@@ -96,7 +96,9 @@ are reset again when the microVM is torn down.
   balloon devices and memory hot-plugging are rejected in configurations with
   passthrough devices.
 - **No snapshot support.** The state of a physical device is not visible to the
-  VMM, so snapshot creation is rejected while a passthrough device is attached.
+  VMM, so snapshot creation is rejected while a passthrough device is attached,
+  and snapshots cannot be loaded into a microVM that has passthrough devices
+  configured.
 - **No hot-plugging.** Devices can only be attached before boot.
 - **MSI-X only.** Legacy INTx interrupts are not supported.
 - **No BAR relocation.** The guest has to keep the BAR addresses that the

@@ -79,6 +79,8 @@ pub enum ResourcesError {
     DevicePassthroughWithMemHotplug,
     /// Passthrough devices are not compatible with memory balloon device
     DevicePassthroughWithBalloon,
+    /// Passthrough devices cannot be restored from a snapshot
+    DevicePassthroughWithSnapshotRestore,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
@@ -273,6 +275,18 @@ impl VmResources {
     pub fn compatible_with_balloon(&self) -> Result<(), ResourcesError> {
         if !self.device_passthrough.configs.is_empty() {
             return Err(ResourcesError::DevicePassthroughWithBalloon);
+        }
+        Ok(())
+    }
+
+    /// Check if the current config can be used to restore a microVM from a snapshot
+    ///
+    /// The state of a passthrough device is not part of the snapshot, so restoring
+    /// a microVM with passthrough devices configured would silently leave the
+    /// guest without them.
+    pub fn compatible_with_snapshot_restore(&self) -> Result<(), ResourcesError> {
+        if !self.device_passthrough.configs.is_empty() {
+            return Err(ResourcesError::DevicePassthroughWithSnapshotRestore);
         }
         Ok(())
     }

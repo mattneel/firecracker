@@ -324,6 +324,8 @@ impl fmt::Debug for PrebootApiController<'_> {
 pub enum LoadSnapshotError {
     /// Loading a microVM snapshot not allowed after configuring boot-specific resources.
     LoadSnapshotNotAllowed,
+    /// Invalid configuration for restoring a microVM from a snapshot: {0}
+    InvalidResources(#[from] ResourcesError),
     /// Failed to restore from snapshot: {0}
     RestoreFromSnapshot(#[from] RestoreFromSnapshotError),
     /// Failed to resume microVM: {0}
@@ -673,6 +675,14 @@ impl<'a> PrebootApiController<'a> {
         load_params: &LoadSnapshotParams,
     ) -> Result<VmmData, LoadSnapshotError> {
         let load_start_us = get_time_us(ClockType::Monotonic);
+
+        // Passthrough devices are configured before the snapshot is loaded, but their state is
+        // not part of it, so restore them is not possible yet.
+        if let Err(err) = self.vm_resources.compatible_with_snapshot_restore() {
+            let err = LoadSnapshotError::InvalidResources(err);
+            info!("{}", err);
+            return Err(err);
+        }
 
         if self.boot_path {
             let err = LoadSnapshotError::LoadSnapshotNotAllowed;

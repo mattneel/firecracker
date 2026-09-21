@@ -63,6 +63,30 @@ def test_api_device_passthrough_runtime(uvm):
         vm.api.device_passthrough.put(id="nvme69", sbdf="01:02.03")
 
 
+@pin_pci(True)
+@pin_guest_kernel(GUEST_KERNEL_DEFAULT)
+def test_device_passthrough_cannot_be_restored(
+    uvm_booted, microvm_factory, guest_kernel, rootfs
+):
+    """
+    Test that a snapshot cannot be restored with passthrough devices configured.
+
+    The state of a passthrough device is not part of a snapshot, so the device
+    would silently be missing from the guest.
+    """
+    snapshot = uvm_booted.snapshot_full()
+    uvm_booted.kill()
+
+    vm = microvm_factory.build(guest_kernel, rootfs, pci=True)
+    vm.spawn()
+    vm.basic_config()
+    vm.api.device_passthrough.put(id="nvme0", sbdf="0000:01:02.03")
+
+    expected_msg = re.escape("Passthrough devices cannot be restored from a snapshot")
+    with pytest.raises(RuntimeError, match=expected_msg):
+        vm.restore_from_snapshot(snapshot)
+
+
 @pin_guest_kernel(GUEST_KERNEL_DEFAULT)
 def test_device_passthrough_incompatible_devices_no_pci(
     microvm_factory, guest_kernel, rootfs
